@@ -1,5 +1,6 @@
 package dev.princemaurya.leaderboard.leaderboard;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -9,6 +10,10 @@ import java.util.stream.Collectors;
 
 import dev.princemaurya.leaderboard.score.PlayerScore;
 
+import org.springframework.data.redis.connection.RedisZSetCommands.ZAddArgs;
+import org.springframework.data.redis.connection.zset.DefaultTuple;
+import org.springframework.data.redis.connection.zset.Tuple;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.data.redis.core.ZSetOperations.TypedTuple;
@@ -17,9 +22,12 @@ import org.springframework.stereotype.Component;
 @Component
 public class LeaderboardCache {
 
+	private final StringRedisTemplate redis;
+
 	private final ZSetOperations<String, String> zSet;
 
 	public LeaderboardCache(StringRedisTemplate redis) {
+		this.redis = redis;
 		this.zSet = redis.opsForZSet();
 	}
 
@@ -27,11 +35,15 @@ public class LeaderboardCache {
 		if (totals.isEmpty()) {
 			return;
 		}
-		// absolute totals, not increments, so retries are harmless
-		Set<TypedTuple<String>> tuples = totals.stream()
-			.map(score -> TypedTuple.of(score.getId().getPlayerId(), (double) score.getTotalPoints()))
+		// absolute totals, not increments, so retries are harmless; totals never decrease, so
+		// ZADD GT keeps a stale write (late retry, concurrent rebuild) from overwriting a newer one
+		byte[] key = key(gameId).getBytes(StandardCharsets.UTF_8);
+		Set<Tuple> tuples = totals.stream()
+			.map(score -> (Tuple) new DefaultTuple(score.getId().getPlayerId().getBytes(StandardCharsets.UTF_8),
+					(double) score.getTotalPoints()))
 			.collect(Collectors.toSet());
-		zSet.add(key(gameId), tuples);
+		redis.execute((RedisCallback<Long>) connection -> connection.zSetCommands()
+			.zAdd(key, tuples, ZAddArgs.empty().gt()));
 	}
 
 	public List<LeaderboardEntry> top(String gameId, int limit) {

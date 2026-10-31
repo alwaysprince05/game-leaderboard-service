@@ -10,6 +10,7 @@ Built with Java 21, Spring Boot 4, Kafka, PostgreSQL, Redis, Flyway, Testcontain
 ```
 POST /api/v1/matches -> Kafka (match-completed) -> consumer -> Postgres (totals) -> Redis (sorted set per game)
 GET  /api/v1/games/{gameId}/leaderboard          -> Redis
+POST /api/v1/admin/games/{gameId}/leaderboard/rebuild -> Postgres -> Redis
 ```
 
 1. The API validates the match and publishes it to Kafka, keyed by `gameId`. It returns `202` only after
@@ -19,13 +20,16 @@ GET  /api/v1/games/{gameId}/leaderboard          -> Redis
    added again.
 3. Points are added with `INSERT ... ON CONFLICT DO UPDATE`, so two updates at the same time can't
    overwrite each other.
-4. After the commit, the player's total from Postgres is written to Redis with `ZADD`. Since it's the full
-   total and not an increment, retrying is safe. If Redis is down, the message gets retried and Redis
-   catches up.
+4. After the commit, the player's total from Postgres is written to Redis with `ZADD GT`. Since it's the full
+   total and not an increment, retrying is safe. Totals never go down, so `GT` also stops a late retry from
+   overwriting a newer total. If Redis is down, the message gets retried and Redis catches up.
 5. If a message keeps failing (3 retries) or can't be parsed, it goes to `match-completed.dlt` so it doesn't
    block the partition.
 
-Postgres is the source of truth. Redis is just for fast reads (rank lookups are O(log N)).
+Postgres is the source of truth. Redis is just for fast reads (rank lookups are O(log N)). If Redis loses
+data, the rebuild endpoint reloads a game from Postgres in pages of 1,000 players (keyset pagination on the
+`(game_id, player_id)` primary key, so new players arriving mid-rebuild can't shift pages). It's safe to run
+while matches are being processed, because of `ZADD GT`.
 
 ## API
 
@@ -60,6 +64,13 @@ Errors are returned as problem details (RFC 9457):
 - `404` player has no score in that game
 - `503` Kafka didn't ack in time, safe to retry with the same `matchId`
 
+Rebuild a game's leaderboard from Postgres (after a Redis flush or restart without persistence):
+
+```bash
+curl -X POST localhost:8080/api/v1/admin/games/fc-arena/leaderboard/rebuild
+# {"gameId":"fc-arena","playersLoaded":2}
+```
+
 ## Running it
 
 Needs JDK 21+ and Docker.
@@ -89,12 +100,12 @@ Metrics are at `/actuator/prometheus` (`leaderboard_matches_processed_total`,
 ```
 
 Unit tests, `@WebMvcTest` controller tests, and integration tests that run against real Postgres, Redis and
-Kafka using Testcontainers (full flow, duplicate matches, bad message going to the DLT). CI runs the same
+Kafka using Testcontainers (full flow, duplicate matches, bad message going to the DLT, rebuilding after Redis data loss, stale cache
+writes being ignored). CI runs the same
 thing on GitHub Actions.
 
 ## TODO
 
-- rebuild a game's Redis set from Postgres (the index on `(game_id, total_points desc)` is there for it)
 - tie-breaking by time; right now equal scores are ordered by player id
-- auth + rate limiting on the write endpoint
+- auth + rate limiting on the write and admin endpoints
 - tracing with OpenTelemetry

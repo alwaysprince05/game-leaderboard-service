@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.UUID;
 
 import dev.princemaurya.leaderboard.config.LeaderboardProperties;
+import dev.princemaurya.leaderboard.leaderboard.LeaderboardCache;
 import dev.princemaurya.leaderboard.score.PlayerScore;
 import dev.princemaurya.leaderboard.score.PlayerScoreId;
 import dev.princemaurya.leaderboard.score.PlayerScoreRepository;
@@ -17,6 +18,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.MediaType;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -50,6 +52,12 @@ class LeaderboardIntegrationTests {
 
 	@Autowired
 	private ConsumerFactory<String, String> consumerFactory;
+
+	@Autowired
+	private StringRedisTemplate redis;
+
+	@Autowired
+	private LeaderboardCache leaderboardCache;
 
 	@Test
 	void rankedLeaderboardReflectsSubmittedMatches() throws Exception {
@@ -109,6 +117,59 @@ class LeaderboardIntegrationTests {
 				assertThat(deadLetters).containsExactly("{this is not json");
 			});
 		}
+	}
+
+	@Test
+	void rebuildRestoresLeaderboardAfterRedisDataLoss() throws Exception {
+		String game = "game-" + shortId();
+		submit(UUID.randomUUID(), game, "alice", 30, "bob", 50);
+		submit(UUID.randomUUID(), game, "alice", 40, "carol", 20);
+		await().atMost(TIMEOUT).untilAsserted(() -> mvc.perform(get("/api/v1/games/{game}/leaderboard", game))
+			.andExpect(jsonPath("$.entries.length()").value(3)));
+
+		redis.delete("leaderboard:" + game);
+		mvc.perform(get("/api/v1/games/{game}/leaderboard/players/{player}", game, "alice"))
+			.andExpect(status().isNotFound());
+
+		mvc.perform(post("/api/v1/admin/games/{game}/leaderboard/rebuild", game))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.gameId").value(game))
+			.andExpect(jsonPath("$.playersLoaded").value(3));
+
+		mvc.perform(get("/api/v1/games/{game}/leaderboard", game))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.entries[0].playerId").value("alice"))
+			.andExpect(jsonPath("$.entries[0].points").value(70))
+			.andExpect(jsonPath("$.entries[1].playerId").value("bob"))
+			.andExpect(jsonPath("$.entries[1].points").value(50))
+			.andExpect(jsonPath("$.entries[2].playerId").value("carol"))
+			.andExpect(jsonPath("$.entries[2].points").value(20));
+	}
+
+	@Test
+	void staleTotalNeverOverwritesNewerCachedTotal() throws Exception {
+		String game = "game-" + shortId();
+		submit(UUID.randomUUID(), game, "alice", 10, "bob", 1);
+		await().atMost(TIMEOUT)
+			.until(() -> playerScores.findById(new PlayerScoreId(game, "alice")).isPresent());
+		PlayerScore staleAlice = playerScores.findById(new PlayerScoreId(game, "alice")).orElseThrow();
+
+		submit(UUID.randomUUID(), game, "alice", 25, "bob", 1);
+		await().atMost(TIMEOUT).untilAsserted(() -> mvc.perform(get("/api/v1/games/{game}/leaderboard/players/{player}", game, "alice"))
+			.andExpect(jsonPath("$.points").value(35)));
+
+		// e.g. a late retry still holding the total from before the second match
+		leaderboardCache.setTotals(game, List.of(staleAlice));
+
+		mvc.perform(get("/api/v1/games/{game}/leaderboard/players/{player}", game, "alice"))
+			.andExpect(jsonPath("$.points").value(35));
+	}
+
+	@Test
+	void rebuildOfUnknownGameLoadsNothing() throws Exception {
+		mvc.perform(post("/api/v1/admin/games/{game}/leaderboard/rebuild", "no-such-game-" + shortId()))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.playersLoaded").value(0));
 	}
 
 	@Test
